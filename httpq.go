@@ -3,21 +3,27 @@ package httpq
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
-	"slices"
+	"strings"
+	"time"
 )
 
-var (
-	GlobalLoggingFlag = true
+type (
+	ResponseModel[T any] struct {
+		Data        T
+		StatusCode  int
+		Headers     map[string]string
+		ContentType string
+		RawBody     []byte
+	}
+	ContentType int
 )
-
-type ContentType int
 
 const (
 	ContentNone ContentType = iota
@@ -28,36 +34,50 @@ const (
 )
 
 type Rpc struct {
-	client                  *http.Client
-	method                  string
-	url                     string
-	body                    any
-	header                  map[string]string
-	logging                 bool
-	loggingNetworkError     bool
-	returnErrorGt200        bool
-	ignoreStatusCodeAsError []int
-	conentType              ContentType
-	contentTypeString       string
+	client             *http.Client
+	method             string
+	url                string
+	body               any
+	header             map[string]string
+	logging            bool
+	logger             *slog.Logger
+	contentType        ContentType
+	contentTypeString  string
+	insecureSkipVerify bool
 }
 
 func NewRpc() *Rpc {
 	dc := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// return http.ErrUseLastResponse
-			return nil
-		},
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		},
+		CheckRedirect: nil,
 	}
-	return &Rpc{
-		conentType:        ContentJson,
+	r := &Rpc{
+		contentType:       ContentJson,
 		contentTypeString: "application/json",
 		client:            dc,
 	}
+	return r
+}
+
+func (r *Rpc) getLogger() *slog.Logger {
+	if r.logger != nil {
+		return r.logger
+	}
+	return slog.Default()
+}
+
+func (r *Rpc) SetTransport(val http.RoundTripper) *Rpc {
+	r.client.Transport = val
+	return r
+}
+
+func (r *Rpc) SetRedirectFunc(val func(req *http.Request, via []*http.Request) error) *Rpc {
+	r.client.CheckRedirect = val
+	return r
+}
+
+func (r *Rpc) SetLogger(logger *slog.Logger) *Rpc {
+	r.logger = logger
+	return r
 }
 
 func (r *Rpc) Method(val string) *Rpc {
@@ -65,50 +85,103 @@ func (r *Rpc) Method(val string) *Rpc {
 	return r
 }
 
-func (r *Rpc) Url(val string) *Rpc {
+func (r *Rpc) Get() *Rpc {
+	r.method = http.MethodGet
+	return r
+}
+
+func (r *Rpc) Post() *Rpc {
+	r.method = http.MethodPost
+	return r
+}
+
+func (r *Rpc) Put() *Rpc {
+	r.method = http.MethodPut
+	return r
+}
+
+func (r *Rpc) Delete() *Rpc {
+	r.method = http.MethodDelete
+	return r
+}
+
+func (r *Rpc) Patch() *Rpc {
+	r.method = http.MethodPatch
+	return r
+}
+
+func (r *Rpc) Head() *Rpc {
+	r.method = http.MethodHead
+	return r
+}
+
+func (r *Rpc) Options() *Rpc {
+	r.method = http.MethodOptions
+	return r
+}
+
+func (r *Rpc) SetUrl(val string) *Rpc {
 	r.url = val
 	return r
 }
 
-func (r *Rpc) Body(val any) *Rpc {
+func (r *Rpc) SetBody(val any) *Rpc {
 	r.body = val
 	return r
 }
 
-func (r *Rpc) Header(val map[string]string) *Rpc {
+func (r *Rpc) SetHeader(val map[string]string) *Rpc {
 	r.header = val
 	return r
 }
 
-func (r *Rpc) ContentType(val ContentType) *Rpc {
-	r.conentType = val
+func (r *Rpc) SetContentType(val ContentType) *Rpc {
+	r.contentType = val
 	return r
 }
 
-func (r *Rpc) Logging(val bool, onlyNetworkError ...bool) *Rpc {
+func (r *Rpc) None() *Rpc {
+	r.contentType = ContentNone
+	return r
+}
+
+func (r *Rpc) Json() *Rpc {
+	r.contentType = ContentJson
+	return r
+}
+
+func (r *Rpc) Xml() *Rpc {
+	r.contentType = ContentXml
+	return r
+}
+
+func (r *Rpc) Bytes() *Rpc {
+	r.contentType = ContentBytes
+	return r
+}
+
+func (r *Rpc) MultiPart() *Rpc {
+	r.contentType = ContentMultiPart
+	return r
+}
+
+func (r *Rpc) SetLogging(val bool) *Rpc {
 	r.logging = val
-	r.loggingNetworkError = func() bool {
-		if len(onlyNetworkError) > 0 {
-			return onlyNetworkError[0]
-		}
-		return false
-	}()
 	return r
 }
 
-func (r *Rpc) ReturnErrorGt200(val bool, ignoreStatusCodeAsError ...int) *Rpc {
-	r.returnErrorGt200 = val
-	r.ignoreStatusCodeAsError = ignoreStatusCodeAsError
-	return r
-}
-
-func Do[T any](ctx context.Context, r *Rpc) (result *T, err error) {
+func Do[T any](ctx context.Context, r *Rpc, traceID ...string) (result *ResponseModel[T], err error) {
 	body := new(bytes.Buffer)
 	req := new(http.Request)
 	resp := new(http.Response)
+	start := time.Now()
+	var tID string
+	if len(traceID) > 0 {
+		tID = traceID[0]
+	}
 
 	if r.body != nil {
-		switch r.conentType {
+		switch r.contentType {
 		case ContentJson:
 			_ = json.NewEncoder(body).Encode(r.body)
 			r.contentTypeString = "application/json"
@@ -136,20 +209,56 @@ func Do[T any](ctx context.Context, r *Rpc) (result *T, err error) {
 	}
 
 	if r.logging {
-		fmt.Println("request", body.String())
+		r.getLogger().InfoContext(
+			ctx,
+			"httpq: request",
+			"method", r.method,
+			"url", r.url,
+			"trace_id", tID,
+			"content_type", r.contentTypeString,
+			"headers", r.header,
+			"body", body.String(),
+		)
 	}
 
 	req, err = http.NewRequestWithContext(ctx, r.method, r.url, body)
 	if err != nil {
+		if r.logging {
+			r.getLogger().ErrorContext(
+				ctx,
+				"httpq: new request error",
+				"method", r.method,
+				"url", r.url,
+				"trace_id", tID,
+				"error", err,
+			)
+		}
 		return
 	}
 	for k, v := range r.header {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", r.contentTypeString)
+	if tID != "" {
+		// Добавляем trace_id в заголовок, если ещё не установлен пользователем
+		if req.Header.Get("X-Trace-Id") == "" {
+			req.Header.Set("X-Trace-Id", tID)
+		}
+	}
 
 	resp, err = r.client.Do(req)
 	if err != nil {
+		if r.logging {
+			r.getLogger().ErrorContext(
+				ctx,
+				"httpq: do request error",
+				"method", r.method,
+				"url", r.url,
+				"trace_id", tID,
+				"error", err,
+				"duration", time.Since(start),
+			)
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -157,22 +266,93 @@ func Do[T any](ctx context.Context, r *Rpc) (result *T, err error) {
 	var bodyBytes []byte
 	if resp.Body != http.NoBody {
 		bodyBytes, _ = io.ReadAll(resp.Body)
+		ct := resp.Header.Get("Content-Type")
+
 		if r.logging {
-			fmt.Println("status code", resp.Status)
-			fmt.Println("response", string(bodyBytes))
+			// Определяем, текстовый ли это ответ (json/xml/html/любой text/*)
+			isText := strings.HasPrefix(ct, "text/") ||
+				strings.Contains(ct, "json") ||
+				strings.Contains(ct, "xml") ||
+				strings.Contains(ct, "html")
+
+			args := []any{
+				"method", r.method,
+				"url", r.url,
+				"trace_id", tID,
+				"status_code", resp.StatusCode,
+				"status", resp.Status,
+				"duration", time.Since(start),
+				"content_type", ct,
+				"content_length", len(bodyBytes),
+			}
+
+			if isText {
+				args = append(args, "body", string(bodyBytes))
+			} else {
+				// Бинарный/медиа контент — не логируем тело целиком
+				args = append(args,
+					"binary", true,
+				)
+			}
+
+			r.getLogger().InfoContext(
+				ctx,
+				"httpq: response",
+				args...,
+			)
 		}
 
-		result = new(T)
-		if !bytes.HasPrefix(bodyBytes, []byte("<")) {
-			err = json.Unmarshal(bodyBytes, result)
-		} else {
-			if r.logging {
-				fmt.Println("xml?")
+		// Инициализируем модель ответа
+		result = &ResponseModel[T]{
+			StatusCode:  resp.StatusCode,
+			Headers:     map[string]string{},
+			ContentType: ct,
+			RawBody:     bodyBytes,
+		}
+
+		// Копируем заголовки
+		for k, v := range resp.Header {
+			if len(v) > 0 {
+				result.Headers[k] = v[0]
 			}
 		}
-	}
-	if r.returnErrorGt200 && resp.StatusCode != 200 && !slices.Contains(r.ignoreStatusCodeAsError, resp.StatusCode) {
-		err = fmt.Errorf("%d %v", resp.StatusCode, string(bodyBytes))
+
+		// Разбираем тело в Data, если это JSON или XML
+		var data T
+		switch {
+		case strings.Contains(ct, "json"):
+			err = json.Unmarshal(bodyBytes, &data)
+			if err == nil {
+				result.Data = data
+			} else if r.logging {
+				r.getLogger().ErrorContext(
+					ctx,
+					"httpq: json unmarshal error",
+					"method", r.method,
+					"url", r.url,
+					"trace_id", tID,
+					"status_code", resp.StatusCode,
+					"error", err,
+				)
+			}
+		case strings.Contains(ct, "xml") || bytes.HasPrefix(bodyBytes, []byte("<")):
+			err = xml.Unmarshal(bodyBytes, &data)
+			if err == nil {
+				result.Data = data
+			} else if r.logging {
+				r.getLogger().ErrorContext(
+					ctx,
+					"httpq: xml unmarshal error",
+					"method", r.method,
+					"url", r.url,
+					"trace_id", tID,
+					"status_code", resp.StatusCode,
+					"error", err,
+				)
+			}
+		default:
+			// бинарные/медиа типы — в Data не парсим, оставляем только RawBody
+		}
 	}
 
 	return
