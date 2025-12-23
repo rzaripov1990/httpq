@@ -144,9 +144,13 @@ func upload(ctx context.Context, fileBytes []byte) (*httpq.ResponseModel[struct{
 - **HTTP client configuration**
   - `SetTransport(http.RoundTripper)`
   - `SetRedirectFunc(func(req *http.Request, via []*http.Request) error)`
+  - `SetTimeout(time.Duration)`
+- **Cookies**
+  - `SetCookies(map[string]string)` – formats and sets the `Cookie` header
 - **Logging**
   - `SetLogging(bool)`
   - `SetLogger(*slog.Logger)`
+  - `Clone()` – copy all settings except the body (useful for templated requests)
 
 ### `Do` and `ResponseModel[T]`
 
@@ -195,7 +199,7 @@ Behavior depends on the `Content-Type` header and payload:
   - Body is treated as text:
     - Logged as string (if logging is enabled)
     - Available via `RawBody`
-  - `Data` is filled only if `T` подходит для успешного XML/JSON‑парсинга
+  - `Data` is filled only if `T` is compatible with XML/JSON payload
 - **Media / binary** (`image/*`, `application/pdf`, `application/octet-stream`, etc.)
   - No attempt is made to deserialize into `Data`
   - `RawBody` contains the full content
@@ -237,18 +241,69 @@ The trace ID is:
 - included in all log records related to this request (`trace_id` field)
 - automatically propagated in the `X-Trace-Id` header if it is not already set
 
+## Retry Policy
+
+You can configure automatic retries for transient failures via `RetryPolicy`:
+
+```go
+rpc := httpq.NewRpc().
+    Get().
+    SetUrl("https://api.example.com/data").
+    Json().
+    SetRetryPolicy(&httpq.RetryPolicy{
+        MaxRetries:  3,
+        Backoff:     200 * time.Millisecond,
+        Exponential: true, // use exponential backoff: 200ms, 400ms, 800ms...
+        // Retry only on specific status codes:
+        RetryStatusCodes: httpq.DefaultRecommendedRetryStatusCodes,
+    })
+```
+
+`Do` will:
+
+- retry connection errors (no HTTP response, code 0)
+- retry only on statuses listed in `RetryStatusCodes`
+- stop retrying when:
+  - max attempts are exhausted,
+  - a non-retryable status code (not in `RetryStatusCodes`) is returned,
+  - the context is cancelled or times out
+
+You can use the built-in presets:
+
+```go
+// A recommended set of 5xx codes that are typically safe to retry.
+httpq.DefaultRetryable5xx
+
+// A broader set including 5xx and common transient 4xx such as 408 and 429.
+httpq.DefaultRecommendedRetryStatusCodes
+```
+
+For example:
+
+```go
+rpc := httpq.NewRpc().
+    Get().
+    SetUrl("https://api.example.com/data").
+    Json().
+    SetRetryPolicy(&httpq.RetryPolicy{
+        MaxRetries:       5,
+        Backoff:          100 * time.Millisecond,
+        Exponential:      true,
+        RetryStatusCodes: httpq.DefaultRetryable5xx,
+    })
+```
+
 ## Testing
 
 The project includes:
 
-- **Unit-style tests** against controlled responses (JSON/XML/HTML/binary)
-- **Lightweight integration tests** against the public Swagger Petstore  
-  (`https://petstore3.swagger.io/`) for a few `GET` endpoints
+- unit and integration-style tests built on `httptest.Server`, which:
+  - emulate JSON success responses
+  - verify cookie handling
+  - validate retry behavior with `RetryPolicy`
 
 You can run all tests with:
 
 ```bash
 go test ./...
 ```
-
-Note: integration tests require network access and availability of the public Petstore service.

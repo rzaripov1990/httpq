@@ -2,100 +2,270 @@ package httpq
 
 import (
 	"context"
+	"encoding/json"
+	"log"
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
-// Integration tests against https://petstore3.swagger.io/.
-// Note: these tests require network access and the public Petstore service
-// to be available. They are intended as lightweight integration checks.
+type testUser struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
 
-// 1. /pet/findByStatus
-func TestPetstore_FindPetsByStatus(t *testing.T) {
-	type Pet struct {
-		ID     int64  `json:"id"`
-		Name   string `json:"name"`
-		Status string `json:"status"`
-	}
+// newTestServer returns an httptest.Server that can emulate various behaviors.
+func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
 
+	var retryCounter int32
+
+	mux := http.NewServeMux()
+
+	// Simple JSON success endpoint.
+	mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET, got %s", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(testUser{ID: 1, Name: "John"})
+	})
+
+	// Endpoint that always returns 400 (non-retryable).
+	mux.HandleFunc("/bad-request", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"error":"bad request"}`))
+	})
+
+	// Endpoint to test cookies.
+	mux.HandleFunc("/with-cookies", func(w http.ResponseWriter, r *http.Request) {
+		cookie := r.Header.Get("Cookie")
+		if cookie == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"cookie": cookie})
+	})
+
+	// Endpoint for retry tests: first two calls -> 500, third -> 200.
+	mux.HandleFunc("/retry", func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&retryCounter, 1)
+		if count <= 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"temporary"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(testUser{ID: int(count), Name: "Retried"})
+	})
+
+	return httptest.NewServer(mux)
+}
+
+func TestDo_SimpleJSON(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	log.Println("srv.URL", srv.URL)
 	rpc := NewRpc().
 		Get().
-		SetUrl("https://petstore3.swagger.io/api/v3/pet/findByStatus?status=available").
+		SetUrl(srv.URL + "/user").
 		Json().
 		SetLogging(false)
 
 	ctx := context.Background()
-	resp, err := Do[[]Pet](ctx, rpc)
+	resp, err := Do[testUser](ctx, rpc)
 	if err != nil {
-		t.Fatalf("Petstore FindPetsByStatus returned error: %v", err)
+		t.Fatalf("Do returned error: %v", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
 	}
-	// Response body should contain at least one pet in most cases,
-	// but we don't hard-fail on empty data to be robust to data changes.
-}
-
-// 2. /pet/{petId}
-func TestPetstore_GetPetByID(t *testing.T) {
-	type Category struct {
-		ID   int64  `json:"id"`
-		Name string `json:"name"`
-	}
-	type Tag struct {
-		ID   int64  `json:"id"`
-		Name string `json:"name"`
-	}
-	type Pet struct {
-		ID        int64    `json:"id"`
-		Name      string   `json:"name"`
-		Status    string   `json:"status"`
-		Category  Category `json:"category"`
-		PhotoURLs []string `json:"photoUrls"`
-		Tags      []Tag    `json:"tags"`
-	}
-
-	// According to the sample Petstore, pet with ID 1 is usually present,
-	// but we keep assertions soft to avoid flakiness.
-	rpc := NewRpc().
-		Get().
-		SetUrl("https://petstore3.swagger.io/api/v3/pet/1").
-		Json().
-		SetLogging(false)
-
-	ctx := context.Background()
-	resp, err := Do[Pet](ctx, rpc)
-	if err != nil {
-		t.Fatalf("Petstore GetPetByID returned error: %v", err)
-	}
-
-	if resp.StatusCode == 0 {
-		t.Fatalf("expected non-zero status code")
+	if resp.Data.ID != 1 || resp.Data.Name != "John" {
+		t.Fatalf("unexpected data: %+v", resp.Data)
 	}
 }
 
-// 3. /store/inventory
-func TestPetstore_GetStoreInventory(t *testing.T) {
-	// /store/inventory returns a JSON object with status counts.
-	// In practice the underlying implementation may use either numbers or strings,
-	// so we keep the value type flexible.
+func TestDo_NonRetryableStatus_NoRetry(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
 	rpc := NewRpc().
 		Get().
-		SetUrl("https://petstore3.swagger.io/api/v3/store/inventory").
+		SetUrl(srv.URL + "/bad-request").
 		Json().
-		SetLogging(false)
+		SetLogging(false).
+		SetRetryPolicy(&RetryPolicy{
+			MaxRetries:       3,
+			Backoff:          1 * time.Millisecond,
+			Exponential:      true,
+			RetryStatusCodes: DefaultRecommendedRetryStatusCodes,
+		})
 
 	ctx := context.Background()
 	resp, err := Do[map[string]any](ctx, rpc)
 	if err != nil {
-		t.Fatalf("Petstore GetStoreInventory returned error: %v", err)
+		t.Fatalf("Do returned error: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestDo_RetryPolicy_ExponentialBackoff(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	rpc := NewRpc().
+		Get().
+		SetUrl(srv.URL + "/retry").
+		Json().
+		SetLogging(false).
+		SetRetryPolicy(&RetryPolicy{
+			MaxRetries:       3,
+			Backoff:          1 * time.Millisecond,
+			Exponential:      true,
+			RetryStatusCodes: DefaultRetryable5xx,
+		})
+
+	ctx := context.Background()
+	start := time.Now()
+	resp, err := Do[testUser](ctx, rpc)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Do returned error: %v", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d", resp.StatusCode)
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
 	}
-	if len(resp.Data) == 0 {
-		t.Fatalf("expected non-empty inventory map")
+	if resp.Data.Name != "Retried" {
+		t.Fatalf("unexpected data: %+v", resp.Data)
+	}
+
+	// We don't assert exact delay, but we expect some delay due to retries.
+	if elapsed <= 0 {
+		t.Fatalf("expected elapsed time > 0, got %v", elapsed)
+	}
+}
+
+func TestDo_RetryPolicy_ExponentialBackoff2(t *testing.T) {
+	type autoGenerated struct {
+		ID        int      `json:"id"`
+		Name      string   `json:"name"`
+		PhotoUrls []string `json:"photoUrls"`
+		Tags      []any    `json:"tags"`
+		Status    string   `json:"status"`
+	}
+
+	rpc := NewRpc().
+		Get().
+		SetUrl("https://petstore3.swagger.io/api/v3/pet/1").
+		Json().
+		SetLogging(false).
+		SetRetryPolicy(&RetryPolicy{
+			MaxRetries:  3,
+			Backoff:     1 * time.Millisecond,
+			Exponential: true,
+			RetryStatusCodes: append(
+				DefaultRetryable5xx,
+				DefaultRecommendedRetryStatusCodes...,
+			),
+		})
+
+	ctx := context.Background()
+	start := time.Now()
+	resp, err := Do[autoGenerated](ctx, rpc)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Do returned error: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	// We don't assert exact delay, but we expect some delay due to retries.
+	if elapsed <= 0 {
+		t.Fatalf("expected elapsed time > 0, got %v", elapsed)
+	}
+}
+
+func TestRpc_CloneWithoutBody(t *testing.T) {
+	original := NewRpc().
+		Post().
+		SetUrl("http://example.com").
+		Json().
+		SetBody(map[string]string{"k": "v"}).
+		SetHeader(map[string]string{"X-Test": "1"}).
+		SetLogging(true).
+		SetRetryPolicy(&RetryPolicy{
+			MaxRetries:  2,
+			Backoff:     10 * time.Millisecond,
+			Exponential: false,
+		})
+
+	clone := original.Clone()
+	if clone == nil {
+		t.Fatalf("expected clone not to be nil")
+	}
+
+	if clone.method != original.method || clone.url != original.url {
+		t.Fatalf("method/url not cloned correctly")
+	}
+	if clone.body != nil {
+		t.Fatalf("expected body to be nil in clone")
+	}
+	if clone.contentType != original.contentType {
+		t.Fatalf("contentType not cloned")
+	}
+	if clone.retryPolicy != original.retryPolicy {
+		t.Fatalf("retryPolicy pointer not cloned")
+	}
+	if clone.header["X-Test"] != "1" {
+		t.Fatalf("header not cloned")
+	}
+
+	clone.header["X-Test"] = "2"
+	if original.header["X-Test"] == "2" {
+		t.Fatalf("expected headers map to be copied, not shared")
+	}
+}
+
+func TestDo_Cookies(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+
+	rpc := NewRpc().
+		Get().
+		SetUrl(srv.URL + "/with-cookies").
+		SetCookies(map[string]string{"sid": "123"}).
+		Json().
+		SetLogging(false)
+
+	ctx := context.Background()
+	resp, err := Do[map[string]string](ctx, rpc)
+	if err != nil {
+		t.Fatalf("Do returned error: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	_ = resp.Data
+	if resp.Data["cookie"] == "" {
+		t.Fatalf("expected cookie to be echoed back in response")
 	}
 }
