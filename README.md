@@ -1,14 +1,11 @@
-# HTTPQ
+# HTTPQ v3
 
-HTTPQ is a convenient wrapper for working with HTTP requests in Go, providing a simple and flexible API for making HTTP requests.
+HTTPQ is a lightweight, chainable HTTP client for Go that focuses on:
 
-## Key Features
-
-- Support for various content types (JSON, XML, Multipart, Bytes)
-- Configurable error handling
-- Request and response logging
-- Context support
-- Customizable HTTP client
+- **Typed responses** via generics and `ResponseModel[T]`
+- **Convenient builder API** (`Get().SetUrl(...).Json().SetBody(...)`)
+- **Structured logging** with `log/slog`
+- **Safe handling of JSON, XML, HTML, media and arbitrary binary content**
 
 ## Installation
 
@@ -16,176 +13,156 @@ HTTPQ is a convenient wrapper for working with HTTP requests in Go, providing a 
 go get github.com/rzaripov1990/httpq/v3
 ```
 
-## Usage Examples
+Import:
 
-### Basic GET Request
+```go
+import "github.com/rzaripov1990/httpq/v3"
+```
+
+## Quick Start
+
+### Basic GET returning JSON
 
 ```go
 package main
 
 import (
     "context"
-    "github.com/rzaripov1990/httpq/v2"
+    "fmt"
+
+    httpq "github.com/rzaripov1990/httpq/v3"
 )
 
-type Response struct {
-    Message string `json:"message"`
-}
-
-func main() {
-    rpc := httpq.NewRpc().
-        Method("GET").
-        Url("https://api.example.com/data").
-        Logging(true)
-
-    var result Response
-    result, err := httpq.Do[Response](context.Background(), rpc)
-    if err != nil {
-        panic(err)
-    }
-}
-```
-
-### POST Request with JSON
-
-```go
-type Request struct {
-    Name string `json:"name"`
-    Age  int    `json:"age"`
-}
-
-type Response struct {
-    ID string `json:"id"`
-}
-
-func main() {
-    request := Request{
-        Name: "John",
-        Age:  30,
-    }
-
-    rpc := httpq.NewRpc().
-        Method("POST").
-        Url("https://api.example.com/users").
-        Body(request).
-        ContentType(httpq.ContentJson).
-        Logging(true)
-
-    var result Response
-    result, err := httpq.Do[Response](context.Background(), rpc)
-    if err != nil {
-        panic(err)
-    }
-}
-```
-
-### Request with Headers
-
-```go
-rpc := httpq.NewRpc().
-    Method("GET").
-    Url("https://api.example.com/data").
-    Header(map[string]string{
-        "Authorization": "Bearer token",
-        "Custom-Header": "value",
-    })
-```
-
-### Error Handling
-
-```go
-rpc := httpq.NewRpc().
-    Method("GET").
-    Url("https://api.example.com/data").
-    ReturnErrorGt200(true, 404) // Ignore 404 as an error
-
-var result Response
-result, err := httpq.Do[Response](context.Background(), rpc)
-if err != nil {
-    // Handle error
-}
-```
-
-### Multipart Request
-
-```go
-type FormData struct {
-    File    []byte
-    Name    string
-    Comment string
-}
-
-rpc := httpq.NewRpc().
-    Method("POST").
-    Url("https://api.example.com/upload").
-    Body(FormData{
-        File:    fileBytes,
-        Name:    "document.pdf",
-        Comment: "Important document",
-    }).
-    ContentType(httpq.ContentMultiPart)
-```
-
-## Client Configuration
-
-By default, the client is configured with:
-- Disabled SSL certificate verification
-- Allowed redirects
-- Enabled logging
-
-You can modify these settings after client creation:
-
-```go
-rpc := httpq.NewRpc()
-rpc.client.Timeout = time.Second * 30
-```
-
-## Logging
-
-Logging can be enabled/disabled for each request:
-
-```go
-rpc := httpq.NewRpc().
-    Logging(true) // Enable logging
-    // or
-    Logging(true, true) // Log only network errors
-```
-
-## Content Types
-
-The following content types are supported:
-- `ContentJson` - application/json
-- `ContentXml` - application/xml
-- `ContentBytes` - arbitrary bytes
-- `ContentMultiPart` - multipart/form-data
-- `ContentNone` - no content
-
-## Response Handling
-
-The `Do` function automatically deserializes the response into the specified type:
-
-```go
 type User struct {
     ID   int    `json:"id"`
     Name string `json:"name"`
 }
 
-var user User
-user, err := httpq.Do[User](ctx, rpc)
+func main() {
+    rpc := httpq.NewRpc().
+        Get().
+        SetUrl("https://api.example.com/user/1").
+        Json().
+        SetLogging(true)
+
+    resp, err := httpq.Do[User](context.Background(), rpc)
+    if err != nil {
+        panic(err)
+    }
+
+    fmt.Println("status:", resp.StatusCode)
+    fmt.Println("user:", resp.Data)
+}
 ```
-If the response cannot be deserialized into the specified type, an error will be returned. 
 
-## New Functionality (v2)
+### POST with JSON body
 
-### ResponseModel Wrapper
+```go
+type CreateUserRequest struct {
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+}
 
-In the new version, `Do` returns a generic `ResponseModel[T]` that contains:
+type CreateUserResponse struct {
+    ID string `json:"id"`
+}
 
-- `Data T` – deserialized response model
+func createUser(ctx context.Context) (*httpq.ResponseModel[CreateUserResponse], error) {
+    reqBody := CreateUserRequest{
+        Name: "John",
+        Age:  30,
+    }
+
+    rpc := httpq.NewRpc().
+        Post().
+        SetUrl("https://api.example.com/users").
+        Json().
+        SetBody(reqBody).
+        SetLogging(true)
+
+    return httpq.Do[CreateUserResponse](ctx, rpc)
+}
+```
+
+### Request with headers
+
+```go
+rpc := httpq.NewRpc().
+    Get().
+    SetUrl("https://api.example.com/data").
+    SetHeader(map[string]string{
+        "Authorization": "Bearer token",
+        "Custom-Header": "value",
+    }).
+    Json()
+```
+
+### Multipart request (file upload)
+
+```go
+type UploadForm struct {
+    File    []byte
+    Name    string
+    Comment string
+}
+
+func upload(ctx context.Context, fileBytes []byte) (*httpq.ResponseModel[struct{}], error) {
+    rpc := httpq.NewRpc().
+        Post().
+        SetUrl("https://api.example.com/upload").
+        MultiPart().
+        SetBody(UploadForm{
+            File:    fileBytes,
+            Name:    "document.pdf",
+            Comment: "Important document",
+        })
+
+    return httpq.Do[struct{}](ctx, rpc)
+}
+```
+
+## Core Concepts
+
+### `Rpc` builder
+
+`Rpc` describes a single HTTP call and is configured with chainable methods:
+
+- **HTTP method**
+  - `Get()`, `Post()`, `Put()`, `Delete()`, `Patch()`, `Head()`, `Options()`
+  - or generic `Method(string)`
+- **URL & body**
+  - `SetUrl(string)`
+  - `SetBody(any)`
+  - `SetHeader(map[string]string)`
+- **Content type**
+  - `Json()` – `application/json`
+  - `Xml()` – `application/xml`
+  - `Bytes()` – arbitrary bytes
+  - `MultiPart()` – `multipart/form-data`
+  - `None()` – no body
+  - or explicit `SetContentType(httpq.ContentType)`
+- **HTTP client configuration**
+  - `SetTransport(http.RoundTripper)`
+  - `SetRedirectFunc(func(req *http.Request, via []*http.Request) error)`
+- **Logging**
+  - `SetLogging(bool)`
+  - `SetLogger(*slog.Logger)`
+
+### `Do` and `ResponseModel[T]`
+
+`Do` executes the request and returns a typed response wrapper:
+
+```go
+resp, err := httpq.Do[MyType](ctx, rpc, /* optional traceID ...string */)
+```
+
+`ResponseModel[T]` contains:
+
+- `Data T` – deserialized response (for JSON/XML)
 - `StatusCode int` – HTTP status code
-- `Headers map[string]string` – response headers
-- `ContentType string` – value of the `Content-Type` header
-- `RawBody []byte` – raw response body (useful for HTML, media, PDF, images, etc.)
+- `Headers map[string]string` – flattened response headers
+- `ContentType string` – value of `Content-Type`
+- `RawBody []byte` – raw response bytes (HTML, media, binary, etc.)
 
 Example:
 
@@ -201,44 +178,35 @@ if err != nil {
 }
 
 user := resp.Data
-status := resp.StatusCode
-bodyBytes := resp.RawBody
+code := resp.StatusCode
+raw := resp.RawBody
 ```
 
-### Fluent Helpers for Methods and Content Types
+## Content Handling
 
-To make the API more convenient, there are chainable helpers:
+Behavior depends on the `Content-Type` header and payload:
 
-- HTTP methods: `Get()`, `Post()`, `Put()`, `Delete()`, `Patch()`, `Head()`, `Options()`
-- Content types: `Json()`, `Xml()`, `Bytes()`, `MultiPart()`, `None()`
+- **JSON** (`*json*`)
+  - Parsed into `Data` using `json.Unmarshal` into `T`
+  - `RawBody` always contains the original bytes
+- **XML** (`*xml*` or body starting with `<`)  
+  - Parsed into `Data` using `xml.Unmarshal` into `T`
+- **HTML / text** (`text/*`, `*html*`)
+  - Body is treated as text:
+    - Logged as string (if logging is enabled)
+    - Available via `RawBody`
+  - `Data` is filled only if `T` подходит для успешного XML/JSON‑парсинга
+- **Media / binary** (`image/*`, `application/pdf`, `application/octet-stream`, etc.)
+  - No attempt is made to deserialize into `Data`
+  - `RawBody` contains the full content
 
-Example:
+This lets you use the same API both for JSON/XML APIs and for downloading arbitrary binary resources.
 
-```go
-rpc := httpq.NewRpc().
-    Get().
-    SetUrl("https://api.example.com/data").
-    Json().
-    SetLogging(true)
-```
+## Structured Logging and Trace ID
 
-### Extended Configuration Methods
+HTTPQ v3 uses `log/slog` for structured logging.
 
-Additional configuration helpers:
-
-- `SetUrl(string)` – set request URL
-- `SetBody(any)` – set request body
-- `SetHeader(map[string]string)` – set headers
-- `SetContentType(ContentType)` – set content type explicitly
-- `SetTransport(*http.Transport)` – customize HTTP transport
-- `SetRedirectFunc(func(req *http.Request, via []*http.Request) error)` – custom redirect policy
-- `SetLogging(bool)` – enable/disable logging
-
-### Structured Logging with slog
-
-The library now uses `log/slog` for structured logging.
-
-You can inject your own logger:
+### Injecting a custom logger
 
 ```go
 logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -248,39 +216,39 @@ rpc := httpq.NewRpc().
     SetLogging(true)
 ```
 
-When logging is enabled, the following is logged:
+When logging is enabled, the library logs:
 
-- Request: method, URL, headers, content type, body (for text types)
-- Response: method, URL, status, status code, duration, content type, length, and:
+- **Request**: method, URL, headers, content type, body (for text types)
+- **Response**: method, URL, status, status code, duration, content type, content length
   - full body for text types (JSON, XML, HTML, `text/*`)
-  - only metadata (with `binary=true`) for binary/media content (PDF, images, etc.)
-- Errors: request creation, network errors, JSON/XML deserialization errors
+  - only metadata (with `binary=true`) for binary/media content
+- **Errors**: request creation, network errors, JSON/XML deserialization errors
 
-### Optional Trace ID Support
+### Optional trace ID
 
-`Do` supports an optional trace ID parameter that is logged and automatically propagated via the `X-Trace-Id` header (if not already set):
+You can pass an optional trace ID to `Do`:
 
 ```go
 resp, err := httpq.Do[User](ctx, rpc, "trace-12345")
 ```
 
-The `trace_id` field is included in all log records related to this request.
+The trace ID is:
 
-### Handling HTML, Media and Binary Content
-
-Depending on the `Content-Type` header:
-
-- JSON (`*json*`) – deserialized into `Data` via `json.Unmarshal`
-- XML (`*xml*` or body starting with `<`) – deserialized into `Data` via `xml.Unmarshal`
-- HTML and other `text/*` – body is logged as text; you can access it via `RawBody`
-- Media/binary (`image/*`, `application/pdf`, `application/octet-stream`, etc.) – only metadata is logged, content is available as `RawBody` without attempting to deserialize into `Data`
-
-This allows using the same API both for JSON/XML APIs and for downloading arbitrary binary resources.
+- included in all log records related to this request (`trace_id` field)
+- automatically propagated in the `X-Trace-Id` header if it is not already set
 
 ## Testing
 
-Unit tests are not yet implemented. They are planned to cover:
+The project includes:
 
-- JSON/XML deserialization into `ResponseModel[T]`
-- logging behavior (including trace ID)
-- handling of HTML and binary/media content
+- **Unit-style tests** against controlled responses (JSON/XML/HTML/binary)
+- **Lightweight integration tests** against the public Swagger Petstore  
+  (`https://petstore3.swagger.io/`) for a few `GET` endpoints
+
+You can run all tests with:
+
+```bash
+go test ./...
+```
+
+Note: integration tests require network access and availability of the public Petstore service.
