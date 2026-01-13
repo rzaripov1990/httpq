@@ -148,8 +148,9 @@ func upload(ctx context.Context, fileBytes []byte) (*httpq.ResponseModel[struct{
 - **Cookies**
   - `SetCookies(map[string]string)` – formats and sets the `Cookie` header
 - **Logging**
-  - `SetLogging(bool)`
-  - `SetLogger(*slog.Logger)`
+  - `SetLogging(bool)` – enable/disable logging
+  - `SetLogger(*slog.Logger)` – set custom logger
+  - `SetLogLevel(httpq.LogLevel)` – set logging level for requests and responses (Debug, Info, Warn, Error)
   - `Clone()` – copy all settings except the body (useful for templated requests)
 
 ### `Do` and `ResponseModel[T]`
@@ -164,9 +165,15 @@ resp, err := httpq.Do[MyType](ctx, rpc, /* optional traceID ...string */)
 
 - `Data T` – deserialized response (for JSON/XML)
 - `StatusCode int` – HTTP status code
-- `Headers map[string]string` – flattened response headers
+- `Headers map[string][]string` – all response header values (preserves multi-value headers like `Set-Cookie`)
 - `ContentType string` – value of `Content-Type`
 - `RawBody []byte` – raw response bytes (HTML, media, binary, etc.)
+- `ParseError error` – error that occurred during parsing (if any)
+
+**Note:** For backward compatibility, you can use `GetHeader(name string)` method to get the first value of a header:
+```go
+firstCookie := resp.GetHeader("Set-Cookie")
+```
 
 Example:
 
@@ -220,13 +227,46 @@ rpc := httpq.NewRpc().
     SetLogging(true)
 ```
 
+### Logging levels
+
+You can control the logging level for requests and responses using `SetLogLevel()`:
+
+```go
+rpc := httpq.NewRpc().
+    SetLogging(true).
+    SetLogLevel(httpq.LogLevelDebug)  // Use Debug level for requests/responses
+```
+
+Available log levels:
+- `LogLevelDebug` – Debug level for requests and responses
+- `LogLevelInfo` – Info level for requests and responses (default)
+- `LogLevelWarn` – Warn level for requests and responses
+- `LogLevelError` – Error level for requests and responses
+
+**Note:** Error messages (request creation errors, network errors, JSON/XML deserialization errors) are always logged at `Error` level regardless of the `SetLogLevel()` setting.
+
+### Example: Using Debug level for detailed logging
+
+```go
+rpc := httpq.NewRpc().
+    Get().
+    SetUrl("https://api.example.com/data").
+    Json().
+    SetLogging(true).
+    SetLogLevel(httpq.LogLevelDebug)  // Log requests and responses at Debug level
+
+resp, err := httpq.Do[MyType](ctx, rpc)
+```
+
 When logging is enabled, the library logs:
 
-- **Request**: method, URL, headers, content type, body (for text types)
+- **Request**: method, URL, headers, content type, body (for text types) – logged at the level specified by `SetLogLevel()` (default: Info)
 - **Response**: method, URL, status, status code, duration, content type, content length
   - full body for text types (JSON, XML, HTML, `text/*`)
   - only metadata (with `binary=true`) for binary/media content
-- **Errors**: request creation, network errors, JSON/XML deserialization errors
+  - logged at the level specified by `SetLogLevel()` (default: Info)
+- **Retry attempts**: logged at the level specified by `SetLogLevel()` (default: Info)
+- **Errors**: request creation, network errors, JSON/XML deserialization errors – always logged at `Error` level
 
 ### Optional trace ID
 

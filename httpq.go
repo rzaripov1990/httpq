@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -19,15 +20,17 @@ type (
 	// Fields:
 	//   Data        - Parsed response body as type T (unmarshaled JSON/XML/etc. if possible)
 	//   StatusCode  - HTTP response status code (e.g. 200, 404, 500)
-	//   Headers     - Response headers as a map (each key is a header name and value is the first header value)
+	//   Headers     - Response headers as a map (each key is a header name and value is all header values)
 	//   ContentType - The Content-Type of the HTTP response
 	//   RawBody     - Raw response body as bytes (useful for binary content or debugging)
+	//   ParseError  - Error that occurred during parsing (if any)
 	ResponseModel[T any] struct {
 		Data        T
 		StatusCode  int
-		Headers     map[string]string
+		Headers     map[string][]string
 		ContentType string
 		RawBody     []byte
+		ParseError  error
 	}
 	ContentType int
 	RetryPolicy struct {
@@ -63,6 +66,9 @@ var DefaultRecommendedRetryStatusCodes = []int{
 	http.StatusGatewayTimeout,
 }
 
+// DefaultUserAgent is the default User-Agent header value for requests.
+const DefaultUserAgent = "httpq/v3"
+
 func nextRetryDelay(policy *RetryPolicy, attempt int) time.Duration {
 	if policy == nil || attempt <= 0 {
 		return 0
@@ -82,12 +88,17 @@ func isRetryableStatus(policy *RetryPolicy, code int) bool {
 		return true
 	}
 
-	// If policy is not set or has no explicit codes, do not retry based on status.
-	if policy == nil || len(policy.RetryStatusCodes) == 0 {
+	if policy == nil {
 		return false
 	}
 
-	for _, c := range policy.RetryStatusCodes {
+	// If RetryStatusCodes is not set, use default values
+	codes := policy.RetryStatusCodes
+	if len(codes) == 0 {
+		codes = DefaultRetryable5xx
+	}
+
+	for _, c := range codes {
 		if c == code {
 			return true
 		}
@@ -103,6 +114,17 @@ const (
 	ContentMultiPart
 )
 
+// LogLevel represents the logging level for requests and responses.
+// Errors are always logged at Error level regardless of this setting.
+type LogLevel int
+
+const (
+	LogLevelDebug LogLevel = iota // Debug level for requests and responses
+	LogLevelInfo                  // Info level for requests and responses (default)
+	LogLevelWarn                  // Warn level for requests and responses
+	LogLevelError                 // Error level for requests and responses
+)
+
 type Rpc struct {
 	client            *http.Client
 	method            string
@@ -111,6 +133,7 @@ type Rpc struct {
 	header            map[string]string
 	logging           bool
 	logger            *slog.Logger
+	logLevel          LogLevel
 	contentType       ContentType
 	contentTypeString string
 	retryPolicy       *RetryPolicy
@@ -120,7 +143,8 @@ func NewRpc() *Rpc {
 	return &Rpc{
 		contentType:       ContentJson,
 		contentTypeString: "application/json",
-		client:            http.DefaultClient,
+		client:            &http.Client{},
+		logLevel:          LogLevelInfo, // Default to Info level
 	}
 }
 
@@ -130,12 +154,20 @@ func (r *Rpc) Clone() *Rpc {
 		return nil
 	}
 
+	// Create a new http.Client with copied settings
+	cloneClient := &http.Client{
+		Transport:     r.client.Transport,
+		CheckRedirect: r.client.CheckRedirect,
+		Timeout:       r.client.Timeout,
+	}
+
 	clone := &Rpc{
-		client:            r.client,
+		client:            cloneClient,
 		method:            r.method,
 		url:               r.url,
 		logging:           r.logging,
 		logger:            r.logger,
+		logLevel:          r.logLevel,
 		contentType:       r.contentType,
 		contentTypeString: r.contentTypeString,
 		retryPolicy:       r.retryPolicy,
@@ -309,6 +341,39 @@ func (r *Rpc) SetLogging(val bool) *Rpc {
 	return r
 }
 
+// SetLogLevel sets the logging level for requests and responses.
+// Errors are always logged at Error level regardless of this setting.
+// Default is LogLevelInfo.
+func (r *Rpc) SetLogLevel(level LogLevel) *Rpc {
+	r.logLevel = level
+	return r
+}
+
+// GetLogLevel returns the current logging level.
+func (r *Rpc) GetLogLevel() LogLevel {
+	return r.logLevel
+}
+
+// logWithLevel logs a message at the specified level if logging is enabled.
+func (r *Rpc) logWithLevel(ctx context.Context, level LogLevel, msg string, args ...any) {
+	if !r.logging {
+		return
+	}
+	logger := r.getLogger()
+	switch level {
+	case LogLevelDebug:
+		logger.DebugContext(ctx, msg, args...)
+	case LogLevelInfo:
+		logger.InfoContext(ctx, msg, args...)
+	case LogLevelWarn:
+		logger.WarnContext(ctx, msg, args...)
+	case LogLevelError:
+		logger.ErrorContext(ctx, msg, args...)
+	default:
+		logger.InfoContext(ctx, msg, args...)
+	}
+}
+
 // Do executes the configured Rpc, optionally with retries and trace ID, and
 // returns a typed ResponseModel[T] with both parsed data and raw response.
 func Do[T any](ctx context.Context, r *Rpc, traceID ...string) (result *ResponseModel[T], err error) {
@@ -347,8 +412,9 @@ func Do[T any](ctx context.Context, r *Rpc, traceID ...string) (result *Response
 		}
 
 		if r.logging {
-			r.getLogger().InfoContext(
+			r.logWithLevel(
 				ctx,
+				r.logLevel,
 				"httpq: retry",
 				"method", r.method,
 				"url", r.url,
@@ -378,49 +444,59 @@ func Do[T any](ctx context.Context, r *Rpc, traceID ...string) (result *Response
 
 func doOnce[T any](ctx context.Context, r *Rpc, tID string, start time.Time) (result *ResponseModel[T], statusCode int, err error) {
 	body := new(bytes.Buffer)
+	var contentTypeString string
 
 	// (Re)build body and content type for each attempt.
 	if r.body != nil {
 		switch r.contentType {
 		case ContentJson:
-			_ = json.NewEncoder(body).Encode(r.body)
-			r.contentTypeString = "application/json"
+			if err := json.NewEncoder(body).Encode(r.body); err != nil {
+				return nil, 0, fmt.Errorf("json: failed to encode body: %w", err)
+			}
+			contentTypeString = "application/json"
 		case ContentXml:
-			_ = xml.NewEncoder(body).Encode(r.body)
-			r.contentTypeString = "application/xml"
+			if err := xml.NewEncoder(body).Encode(r.body); err != nil {
+				return nil, 0, fmt.Errorf("xml: failed to encode body: %w", err)
+			}
+			contentTypeString = "application/xml"
 		case ContentBytes:
 			if b, ok := r.body.([]byte); ok {
 				_, _ = body.Write(b)
 			}
 		case ContentMultiPart:
-			values := map[string]any{}
-			bts, errMarshal := json.Marshal(r.body)
-			if errMarshal != nil {
-				panic(errMarshal)
+			contentTypeString, err = buildMultipartBody(body, r.body)
+			if err != nil {
+				return nil, 0, err
 			}
-			_ = json.Unmarshal(bts, &values)
-			w := multipart.NewWriter(body)
-			for k, v := range values {
-				wfield, _ := w.CreateFormField(k)
-				_, _ = wfield.Write([]byte(fmt.Sprintf("%v", v)))
-			}
-
-			r.contentTypeString = w.FormDataContentType()
-			_ = w.Close()
 		}
+	} else {
+		contentTypeString = r.contentTypeString
 	}
 
 	if r.logging {
-		r.getLogger().InfoContext(
-			ctx,
-			"httpq: request",
+		args := []any{
 			"method", r.method,
 			"url", r.url,
 			"trace_id", tID,
-			"content_type", r.contentTypeString,
+			"content_type", contentTypeString,
 			"headers", r.header,
-			"body", body.String(),
-		)
+		}
+
+		// Log body only for text types and limited size
+		if body.Len() > 0 && body.Len() < 1024 {
+			bodyStr := body.String()
+			if isTextContent(contentTypeString) {
+				args = append(args, "body", bodyStr)
+			} else {
+				previewLen := 100
+				if len(bodyStr) < previewLen {
+					previewLen = len(bodyStr)
+				}
+				args = append(args, "body_size", body.Len(), "body_preview", bodyStr[:previewLen])
+			}
+		}
+
+		r.logWithLevel(ctx, r.logLevel, "httpq: request", args...)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, r.method, r.url, body)
@@ -440,7 +516,12 @@ func doOnce[T any](ctx context.Context, r *Rpc, tID string, start time.Time) (re
 	for k, v := range r.header {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("Content-Type", r.contentTypeString)
+	if contentTypeString != "" {
+		req.Header.Set("Content-Type", contentTypeString)
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", DefaultUserAgent)
+	}
 	if tID != "" {
 		if req.Header.Get("X-Trace-Id") == "" {
 			req.Header.Set("X-Trace-Id", tID)
@@ -467,9 +548,16 @@ func doOnce[T any](ctx context.Context, r *Rpc, tID string, start time.Time) (re
 	statusCode = resp.StatusCode
 
 	var bodyBytes []byte
+	var ct string
 	if resp.Body != http.NoBody {
-		bodyBytes, _ = io.ReadAll(resp.Body)
-		ct := resp.Header.Get("Content-Type")
+		var readErr error
+		bodyBytes, readErr = io.ReadAll(resp.Body)
+		if readErr != nil {
+			// Ensure body is fully read for Keep-Alive connections
+			io.Copy(io.Discard, resp.Body)
+			return nil, statusCode, fmt.Errorf("failed to read response body: %w", readErr)
+		}
+		ct = resp.Header.Get("Content-Type")
 
 		if r.logging {
 			isText := strings.HasPrefix(ct, "text/") ||
@@ -496,8 +584,9 @@ func doOnce[T any](ctx context.Context, r *Rpc, tID string, start time.Time) (re
 				)
 			}
 
-			r.getLogger().InfoContext(
+			r.logWithLevel(
 				ctx,
+				r.logLevel,
 				"httpq: response",
 				args...,
 			)
@@ -505,24 +594,25 @@ func doOnce[T any](ctx context.Context, r *Rpc, tID string, start time.Time) (re
 
 		result = &ResponseModel[T]{
 			StatusCode:  resp.StatusCode,
-			Headers:     map[string]string{},
+			Headers:     make(map[string][]string),
 			ContentType: ct,
 			RawBody:     bodyBytes,
 		}
 
-		// Копируем заголовки
+		// Copy all header values
 		for k, v := range resp.Header {
 			if len(v) > 0 {
-				result.Headers[k] = v[0]
+				result.Headers[k] = v
 			}
 		}
 
-		// Разбираем тело в Data, если 	это JSON или XML
+		// Parse body into Data if it's JSON or XML
 		var data T
+		var parseErr error
 		switch {
 		case strings.Contains(ct, "json"):
-			err = json.Unmarshal(bodyBytes, &data)
-			if err == nil {
+			parseErr = json.Unmarshal(bodyBytes, &data)
+			if parseErr == nil {
 				result.Data = data
 			} else if r.logging {
 				r.getLogger().ErrorContext(
@@ -532,12 +622,13 @@ func doOnce[T any](ctx context.Context, r *Rpc, tID string, start time.Time) (re
 					"url", r.url,
 					"trace_id", tID,
 					"status_code", resp.StatusCode,
-					"error", err,
+					"error", parseErr,
 				)
 			}
+			result.ParseError = parseErr
 		case strings.Contains(ct, "xml") || bytes.HasPrefix(bodyBytes, []byte("<")):
-			err = xml.Unmarshal(bodyBytes, &data)
-			if err == nil {
+			parseErr = xml.Unmarshal(bodyBytes, &data)
+			if parseErr == nil {
 				result.Data = data
 			} else if r.logging {
 				r.getLogger().ErrorContext(
@@ -547,12 +638,111 @@ func doOnce[T any](ctx context.Context, r *Rpc, tID string, start time.Time) (re
 					"url", r.url,
 					"trace_id", tID,
 					"status_code", resp.StatusCode,
-					"error", err,
+					"error", parseErr,
 				)
 			}
+			result.ParseError = parseErr
 		default:
 		}
 	}
 
 	return
+}
+
+// buildMultipartBody builds a multipart form body from the given data using reflection.
+// This is more efficient than marshaling to JSON and then unmarshaling to a map.
+func buildMultipartBody(body *bytes.Buffer, data any) (string, error) {
+	w := multipart.NewWriter(body)
+	defer w.Close()
+
+	rv := reflect.ValueOf(data)
+	if rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return w.FormDataContentType(), nil
+		}
+		rv = rv.Elem()
+	}
+
+	if rv.Kind() != reflect.Struct {
+		// Fallback to JSON marshal/unmarshal for non-struct types
+		values := map[string]any{}
+		bts, errMarshal := json.Marshal(data)
+		if errMarshal != nil {
+			return "", fmt.Errorf("multipart: failed to marshal body: %w", errMarshal)
+		}
+		if err := json.Unmarshal(bts, &values); err != nil {
+			return "", fmt.Errorf("multipart: failed to unmarshal body: %w", err)
+		}
+		for k, v := range values {
+			wfield, err := w.CreateFormField(k)
+			if err != nil {
+				return "", fmt.Errorf("multipart: failed to create field %s: %w", k, err)
+			}
+			if _, err := wfield.Write([]byte(fmt.Sprintf("%v", v))); err != nil {
+				return "", fmt.Errorf("multipart: failed to write field %s: %w", k, err)
+			}
+		}
+		return w.FormDataContentType(), nil
+	}
+
+	rt := rv.Type()
+	for i := 0; i < rv.NumField(); i++ {
+		field := rt.Field(i)
+		value := rv.Field(i)
+
+		// Skip unexported fields
+		if !value.CanInterface() {
+			continue
+		}
+
+		// Get field name from form tag or use lowercase field name
+		fieldName := field.Tag.Get("form")
+		if fieldName == "" {
+			fieldName = strings.ToLower(field.Name)
+		}
+
+		wfield, err := w.CreateFormField(fieldName)
+		if err != nil {
+			return "", fmt.Errorf("multipart: failed to create field %s: %w", fieldName, err)
+		}
+
+		// Convert value to string
+		var valueStr string
+		switch value.Kind() {
+		case reflect.String:
+			valueStr = value.String()
+		case reflect.Slice, reflect.Array:
+			if value.Type().Elem().Kind() == reflect.Uint8 {
+				// []byte
+				valueStr = string(value.Bytes())
+			} else {
+				valueStr = fmt.Sprintf("%v", value.Interface())
+			}
+		default:
+			valueStr = fmt.Sprintf("%v", value.Interface())
+		}
+
+		if _, err := wfield.Write([]byte(valueStr)); err != nil {
+			return "", fmt.Errorf("multipart: failed to write field %s: %w", fieldName, err)
+		}
+	}
+
+	return w.FormDataContentType(), nil
+}
+
+// isTextContent checks if the content type represents text content.
+func isTextContent(ct string) bool {
+	return strings.HasPrefix(ct, "text/") ||
+		strings.Contains(ct, "json") ||
+		strings.Contains(ct, "xml") ||
+		strings.Contains(ct, "html")
+}
+
+// GetHeader returns the first value of the header with the given name.
+// This is a convenience method for backward compatibility.
+func (r *ResponseModel[T]) GetHeader(name string) string {
+	if values := r.Headers[name]; len(values) > 0 {
+		return values[0]
+	}
+	return ""
 }
